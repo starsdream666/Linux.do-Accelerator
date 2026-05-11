@@ -1,23 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use std::{fs::OpenOptions, io::Write};
 
-use anyhow::{Context, Error, Result, bail};
+use anyhow::{bail, Context, Error, Result};
 use eframe::egui::{self, FontDefinitions, FontFamily, FontId, RichText};
 #[cfg(target_os = "linux")]
 use gtk::glib::{self, ControlFlow};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use tray_icon::TrayIcon;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use tray_icon::TrayIcon;
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -338,10 +338,14 @@ struct AcceleratorApp {
     hidden_to_tray: bool,
     #[cfg(target_os = "linux")]
     last_minimized: bool,
+    #[cfg(target_os = "linux")]
+    allow_window_close: bool,
     #[cfg(target_os = "macos")]
     hidden_to_tray: bool,
     #[cfg(target_os = "macos")]
     last_minimized: bool,
+    #[cfg(target_os = "macos")]
+    allow_window_close: bool,
     #[cfg(target_os = "windows")]
     tray: Option<TrayState>,
     #[cfg(target_os = "windows")]
@@ -352,6 +356,8 @@ struct AcceleratorApp {
     hidden_to_tray: bool,
     #[cfg(target_os = "windows")]
     last_minimized: bool,
+    #[cfg(target_os = "windows")]
+    allow_window_close: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -452,10 +458,14 @@ impl AcceleratorApp {
             hidden_to_tray: false,
             #[cfg(target_os = "linux")]
             last_minimized: false,
+            #[cfg(target_os = "linux")]
+            allow_window_close: false,
             #[cfg(target_os = "macos")]
             hidden_to_tray: false,
             #[cfg(target_os = "macos")]
             last_minimized: false,
+            #[cfg(target_os = "macos")]
+            allow_window_close: false,
             #[cfg(target_os = "windows")]
             tray,
             #[cfg(target_os = "windows")]
@@ -466,6 +476,8 @@ impl AcceleratorApp {
             hidden_to_tray: false,
             #[cfg(target_os = "windows")]
             last_minimized: false,
+            #[cfg(target_os = "windows")]
+            allow_window_close: false,
         }
     }
 
@@ -849,7 +861,7 @@ impl AcceleratorApp {
                         ui.add(title_bar_button("X", egui::vec2(38.0, 28.0), true, true));
                     self.register_drag_blocker(close_response.rect);
                     if close_response.clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        self.close_window_or_hide_to_tray(ctx);
                     }
                     ui.add_space(2.0);
                     let minimize_response =
@@ -1621,6 +1633,7 @@ impl AcceleratorApp {
             Ok(()) => {
                 self.hidden_to_tray = true;
                 self.last_minimized = true;
+                self.allow_window_close = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             Err(error) => {
@@ -1636,6 +1649,40 @@ impl AcceleratorApp {
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn should_keep_alive_after_window_close(&self) -> bool {
+        self.status.running || self.busy || self.action_rx.is_some() || self.owns_ui_lease
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn close_window_or_hide_to_tray(&mut self, ctx: &egui::Context) {
+        if self.should_keep_alive_after_window_close() {
+            self.minimize_to_tray(ctx);
+        } else {
+            self.allow_window_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    fn close_window_or_hide_to_tray(&mut self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    fn handle_close_requested(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) || self.allow_window_close {
+            return;
+        }
+
+        if self.should_keep_alive_after_window_close() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.minimize_to_tray(ctx);
+        } else {
+            self.allow_window_close = true;
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1659,6 +1706,10 @@ impl AcceleratorApp {
                     #[cfg(target_os = "linux")]
                     if let Some(tray) = &self.tray {
                         let _ = tray.control_tx.send(TrayVisibilityCommand::Quit);
+                    }
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.allow_window_close = true;
                     }
                     #[cfg(target_os = "linux")]
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1699,6 +1750,7 @@ impl AcceleratorApp {
                     if let Some(tray) = &self.tray {
                         let _ = tray.tray_icon.set_visible(false);
                     }
+                    self.allow_window_close = true;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             }
@@ -1784,6 +1836,9 @@ impl AcceleratorApp {
 
 impl eframe::App for AcceleratorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+        self.handle_close_requested(ctx);
+
         #[cfg(target_os = "linux")]
         {
             self.poll_tray_events(ctx);
