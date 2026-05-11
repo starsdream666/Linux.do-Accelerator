@@ -1,23 +1,23 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 #[cfg(target_os = "linux")]
 use std::{fs::OpenOptions, io::Write};
 
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, bail};
 use eframe::egui::{self, FontDefinitions, FontFamily, FontId, RichText};
 #[cfg(target_os = "linux")]
 use gtk::glib::{self, ControlFlow};
 #[cfg(target_os = "windows")]
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
-use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use tray_icon::TrayIcon;
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 
@@ -30,7 +30,8 @@ use crate::platform::run_elevated;
 use crate::platform::spawn_detached;
 #[cfg(target_os = "windows")]
 use crate::platform::{
-    apply_app_window_icon, hide_app_window, restore_app_window, update_windows_shortcuts_for_exe,
+    apply_app_window_icon, hide_app_window, is_app_window_available, restore_app_window,
+    update_windows_shortcuts_for_exe,
 };
 use crate::runtime_log::{append as append_runtime_log, read_recent_lines};
 use crate::service;
@@ -106,6 +107,30 @@ pub fn run(config_path: PathBuf, auto_start: bool) -> Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+#[cfg(target_os = "windows")]
+pub fn restore_existing_window(config_path: &Path) -> bool {
+    let Ok(paths) = service::resolve_paths(Some(config_path.to_path_buf())) else {
+        return false;
+    };
+    let Ok(Some(lease)) = state::read_ui_lease(&paths) else {
+        return false;
+    };
+    if lease.owner_pid == std::process::id()
+        || !crate::platform::is_process_running(lease.owner_pid)
+    {
+        let _ = state::clear_ui_lease(&paths);
+        return false;
+    }
+    let Some(hwnd) = lease.window_handle else {
+        return false;
+    };
+    if !is_app_window_available(hwnd) {
+        let _ = state::clear_ui_lease(&paths);
+        return false;
+    }
+    restore_app_window(hwnd).is_ok()
+}
+
 fn default_renderer() -> eframe::Renderer {
     eframe::Renderer::Glow
 }
@@ -139,7 +164,7 @@ pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
     let config_for_timeout = config_path.clone();
-    let tray_lease_stop = spawn_ui_lease_heartbeat(config_path.clone());
+    let tray_lease_stop = spawn_ui_lease_heartbeat(config_path.clone(), None);
     let tray_lease_stop_in_loop = tray_lease_stop.clone();
 
     let _menu_handler = MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
@@ -262,7 +287,7 @@ pub fn run_tray_shell(config_path: PathBuf) -> Result<()> {
     let quit_item = MenuItem::with_id("tray-quit", "退出程序", true, None);
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
-    let tray_lease_stop = spawn_ui_lease_heartbeat(config_path.clone());
+    let tray_lease_stop = spawn_ui_lease_heartbeat(config_path.clone(), None);
 
     let event_loop = EventLoop::<TrayShellEvent>::with_user_event()
         .build()
@@ -376,6 +401,7 @@ struct TrayState {
 #[cfg(target_os = "windows")]
 struct TrayState {
     tray_icon: tray_icon::TrayIcon,
+    event_stop: Arc<AtomicBool>,
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -401,15 +427,6 @@ impl AcceleratorApp {
         let edge_node_input = config.edge_node_override().unwrap_or_default().to_string();
         let config_modified_at = file_modified_at(&config_path);
         let status = service::status(Some(config_path.clone())).unwrap_or_default();
-        let owns_ui_lease = service::resolve_paths(Some(config_path.clone()))
-            .ok()
-            .and_then(|paths| state::read_ui_lease(&paths).ok().flatten())
-            .is_some();
-        let ui_lease_stop = if owns_ui_lease {
-            Some(spawn_ui_lease_heartbeat(config_path.clone()))
-        } else {
-            None
-        };
         let recent_logs = load_recent_runtime_logs(&config_path);
         let runtime_log_modified_at = runtime_log_file_modified_at(&config_path);
         #[cfg(target_os = "windows")]
@@ -427,6 +444,14 @@ impl AcceleratorApp {
         if let Some(hwnd) = window_handle {
             let _ = apply_app_window_icon(hwnd);
         }
+        #[cfg(not(target_os = "windows"))]
+        let window_handle = None;
+        let owns_ui_lease = touch_ui_lease_for_config(&config_path, window_handle);
+        let ui_lease_stop = if owns_ui_lease {
+            Some(spawn_ui_lease_heartbeat(config_path.clone(), window_handle))
+        } else {
+            None
+        };
         #[cfg(target_os = "windows")]
         let (tray, tray_rx) = build_windows_tray_state(&cc.egui_ctx);
         Self {
@@ -539,7 +564,10 @@ impl AcceleratorApp {
                 if let Some(stop) = self.ui_lease_stop.take() {
                     stop.store(true, Ordering::Relaxed);
                 }
-                self.ui_lease_stop = Some(spawn_ui_lease_heartbeat(self.config_path.clone()));
+                self.ui_lease_stop = Some(spawn_ui_lease_heartbeat(
+                    self.config_path.clone(),
+                    self.window_handle_for_lease(),
+                ));
             }
         }
 
@@ -1681,7 +1709,7 @@ impl AcceleratorApp {
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn should_keep_alive_after_window_close(&self) -> bool {
-        self.status.running || self.busy || self.action_rx.is_some() || self.owns_ui_lease
+        self.status.running || self.busy || self.action_rx.is_some()
     }
 
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
@@ -1748,7 +1776,21 @@ impl AcceleratorApp {
 
     fn touch_ui_lease(&self) -> Result<()> {
         let paths = service::resolve_paths(Some(self.config_path.clone()))?;
-        state::touch_ui_lease(&paths, std::process::id())
+        state::touch_ui_lease_with_window(
+            &paths,
+            std::process::id(),
+            self.window_handle_for_lease(),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn window_handle_for_lease(&self) -> Option<isize> {
+        self.window_handle
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn window_handle_for_lease(&self) -> Option<isize> {
+        None
     }
 
     fn clear_ui_lease(&self) {
@@ -1781,6 +1823,7 @@ impl AcceleratorApp {
                 TrayCommand::Restore => self.restore_from_tray(ctx),
                 TrayCommand::Quit => {
                     if let Some(tray) = &self.tray {
+                        tray.event_stop.store(true, Ordering::Relaxed);
                         let _ = tray.tray_icon.set_visible(false);
                     }
                     self.allow_window_close = true;
@@ -1979,6 +2022,11 @@ impl eframe::App for AcceleratorApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        #[cfg(target_os = "windows")]
+        if let Some(tray) = &self.tray {
+            tray.event_stop.store(true, Ordering::Relaxed);
+            let _ = tray.tray_icon.set_visible(false);
+        }
         if let Some(stop) = self.ui_lease_stop.take() {
             stop.store(true, Ordering::Relaxed);
         }
@@ -2143,13 +2191,15 @@ fn ui_lease_exists(config_path: &Path) -> bool {
         .is_some()
 }
 
-fn touch_ui_lease_for_config(config_path: &Path) {
-    if let Ok(paths) = service::resolve_paths(Some(config_path.to_path_buf())) {
-        let _ = state::touch_ui_lease(&paths, std::process::id());
-    }
+fn touch_ui_lease_for_config(config_path: &Path, window_handle: Option<isize>) -> bool {
+    service::resolve_paths(Some(config_path.to_path_buf()))
+        .and_then(|paths| {
+            state::touch_ui_lease_with_window(&paths, std::process::id(), window_handle)
+        })
+        .is_ok()
 }
 
-fn spawn_ui_lease_heartbeat(config_path: PathBuf) -> Arc<AtomicBool> {
+fn spawn_ui_lease_heartbeat(config_path: PathBuf, window_handle: Option<isize>) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     if !ui_lease_exists(&config_path) {
         return stop;
@@ -2158,7 +2208,7 @@ fn spawn_ui_lease_heartbeat(config_path: PathBuf) -> Arc<AtomicBool> {
     let stop_flag = stop.clone();
     thread::spawn(move || {
         while !stop_flag.load(Ordering::Relaxed) {
-            touch_ui_lease_for_config(&config_path);
+            let _ = touch_ui_lease_for_config(&config_path, window_handle);
             thread::sleep(Duration::from_secs(2));
         }
     });
@@ -2758,37 +2808,57 @@ fn build_windows_tray_state(ctx: &egui::Context) -> (Option<TrayState>, Receiver
 
     let show_id = show_item.id().clone();
     let quit_id = quit_item.id().clone();
-    let event_tx_click = event_tx.clone();
-    let ctx_menu = ctx.clone();
-    let ctx_tray = ctx.clone();
+    let event_stop = Arc::new(AtomicBool::new(false));
+    let event_stop_thread = event_stop.clone();
+    let menu_rx = MenuEvent::receiver().clone();
+    let tray_rx = TrayIconEvent::receiver().clone();
+    let ctx_events = ctx.clone();
 
-    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        if event.id == show_id {
-            let _ = event_tx.send(TrayCommand::Restore);
-            ctx_menu.request_repaint();
-        } else if event.id == quit_id {
-            let _ = event_tx.send(TrayCommand::Quit);
-            ctx_menu.request_repaint();
-        }
-    }));
+    thread::spawn(move || {
+        while !event_stop_thread.load(Ordering::Relaxed) {
+            let mut handled = false;
+            while let Ok(event) = menu_rx.try_recv() {
+                if event.id == show_id {
+                    let _ = event_tx.send(TrayCommand::Restore);
+                    handled = true;
+                } else if event.id == quit_id {
+                    let _ = event_tx.send(TrayCommand::Quit);
+                    handled = true;
+                }
+            }
 
-    TrayIconEvent::set_event_handler(Some(move |event| match event {
-        TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            ..
-        }
-        | TrayIconEvent::DoubleClick {
-            button: MouseButton::Left,
-            ..
-        } => {
-            let _ = event_tx_click.send(TrayCommand::Restore);
-            ctx_tray.request_repaint();
-        }
-        _ => {}
-    }));
+            while let Ok(event) = tray_rx.try_recv() {
+                match event {
+                    TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    }
+                    | TrayIconEvent::DoubleClick {
+                        button: MouseButton::Left,
+                        ..
+                    } => {
+                        let _ = event_tx.send(TrayCommand::Restore);
+                        handled = true;
+                    }
+                    _ => {}
+                }
+            }
 
-    (Some(TrayState { tray_icon }), event_rx)
+            if handled {
+                ctx_events.request_repaint();
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    (
+        Some(TrayState {
+            tray_icon,
+            event_stop,
+        }),
+        event_rx,
+    )
 }
 
 #[cfg(target_os = "linux")]

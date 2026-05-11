@@ -45,9 +45,9 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, LoadImageW, PostMessageW, SW_HIDE,
-    SW_NORMAL, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow, ShowWindow, WM_CLOSE,
-    WM_SETICON,
+    ICON_BIG, ICON_SMALL, IMAGE_ICON, IsWindow, LR_DEFAULTSIZE, LR_SHARED, LoadImageW,
+    PostMessageW, SW_HIDE, SW_NORMAL, SW_RESTORE, SW_SHOW, SendMessageW, SetForegroundWindow,
+    ShowWindow, WM_CLOSE, WM_SETICON,
 };
 
 const LINUX_CA_FILE_NAME: &str = "linuxdo-accelerator-root-ca.crt";
@@ -757,6 +757,11 @@ if (Get-Command ie4uinit.exe -ErrorAction SilentlyContinue) {{
     );
 
     run_powershell_file(&script)
+}
+
+#[cfg(target_os = "windows")]
+pub fn is_app_window_available(hwnd: isize) -> bool {
+    unsafe { IsWindow(hwnd as HWND) != 0 }
 }
 
 #[cfg(target_os = "windows")]

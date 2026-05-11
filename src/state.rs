@@ -26,6 +26,8 @@ pub struct ServiceState {
 pub struct UiLeaseState {
     pub owner_pid: u32,
     pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_handle: Option<isize>,
 }
 
 impl Default for ServiceState {
@@ -192,9 +194,18 @@ pub fn read_ui_lease(paths: &AppPaths) -> Result<Option<UiLeaseState>> {
 }
 
 pub fn touch_ui_lease(paths: &AppPaths, owner_pid: u32) -> Result<()> {
+    touch_ui_lease_with_window(paths, owner_pid, None)
+}
+
+pub fn touch_ui_lease_with_window(
+    paths: &AppPaths,
+    owner_pid: u32,
+    window_handle: Option<isize>,
+) -> Result<()> {
     let lease = UiLeaseState {
         owner_pid,
         updated_at: now_ts(),
+        window_handle,
     };
     let content =
         serde_json::to_string_pretty(&lease).context("failed to serialize ui lease state")?;

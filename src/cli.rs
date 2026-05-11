@@ -62,6 +62,10 @@ pub fn run(cli: Cli) -> Result<()> {
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             {
                 let config_path = service::init_config(cli.config.clone())?;
+                #[cfg(target_os = "windows")]
+                if gui::restore_existing_window(&config_path) {
+                    return Ok(());
+                }
                 gui::run(config_path, auto_start)?;
             }
             #[cfg(target_os = "android")]
