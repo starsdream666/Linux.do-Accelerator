@@ -29,7 +29,9 @@ use crate::paths::AppPaths;
 use crate::platform::run_elevated;
 use crate::platform::spawn_detached;
 #[cfg(target_os = "windows")]
-use crate::platform::{apply_app_window_icon, update_windows_shortcuts_for_exe};
+use crate::platform::{
+    apply_app_window_icon, hide_app_window, restore_app_window, update_windows_shortcuts_for_exe,
+};
 use crate::runtime_log::{append as append_runtime_log, read_recent_lines};
 use crate::service;
 use crate::state::{self, ServiceState};
@@ -1610,6 +1612,32 @@ impl AcceleratorApp {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    fn hide_window_to_tray(&mut self, ctx: &egui::Context) {
+        match (&self.tray, self.window_handle) {
+            (Some(tray), Some(hwnd)) => {
+                let _ = tray.tray_icon.set_visible(true);
+                self.hidden_to_tray = true;
+                self.last_minimized = false;
+                if let Err(error) = hide_app_window(hwnd) {
+                    self.feedback = format!("隐藏窗口到托盘失败，已退回系统最小化: {error}");
+                    self.minimize_to_tray(ctx);
+                } else {
+                    ctx.request_repaint();
+                }
+            }
+            _ => {
+                self.feedback = "托盘隐藏不可用，已退回系统最小化".to_string();
+                self.minimize_to_tray(ctx);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn hide_window_to_tray(&mut self, ctx: &egui::Context) {
+        self.minimize_to_tray(ctx);
+    }
+
     #[cfg(target_os = "linux")]
     fn minimize_to_tray(&mut self, ctx: &egui::Context) {
         if let Some(tray) = &self.tray {
@@ -1659,7 +1687,7 @@ impl AcceleratorApp {
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     fn close_window_or_hide_to_tray(&mut self, ctx: &egui::Context) {
         if self.should_keep_alive_after_window_close() {
-            self.minimize_to_tray(ctx);
+            self.hide_window_to_tray(ctx);
         } else {
             self.allow_window_close = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1679,7 +1707,7 @@ impl AcceleratorApp {
 
         if self.should_keep_alive_after_window_close() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.minimize_to_tray(ctx);
+            self.hide_window_to_tray(ctx);
         } else {
             self.allow_window_close = true;
         }
@@ -1736,7 +1764,12 @@ impl AcceleratorApp {
         if let Some(tray) = &self.tray {
             let _ = tray.tray_icon.set_visible(false);
         }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        if let Some(hwnd) = self.window_handle {
+            let _ = restore_app_window(hwnd);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         ctx.request_repaint();
     }
